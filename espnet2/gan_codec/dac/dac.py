@@ -636,8 +636,12 @@ class DACGenerator(nn.Module):
         Returns:
             torch.Tensor: resynthesized audio.
         """
-        quantized = self.quantizer.decode(codes)
+        quantized = self.quantizer.decode(codes) # NOTE(yiwen) continuous codec feature should use this one
         resyn_audio = self.decoder(quantized)
+
+        return_decoded=True
+        if return_decoded:
+            return resyn_audio, quantized # waveform, continuous feature
         return resyn_audio
 
 

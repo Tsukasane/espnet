@@ -5,6 +5,7 @@
 
 import numpy as np
 import torch
+import os
 
 from espnet2.speechlm.tokenizer.abs_tokenizer import AbsTokenizer
 
@@ -29,7 +30,7 @@ class CodecTokenizer(AbsTokenizer):
         dump_audio: bool = False,
         checkpoint_path: str = None,
         config_path: str = None,
-        hf_model_tag: str = None,
+        hf_model_tag: str = "ftshijt/espnet_codec_dac_large_v1.4_360epoch", #NOTE(yiwen) temp    None
         max_token_per_frame: int = 8,
     ):
         """Codec Tokenizer initialization
@@ -203,7 +204,9 @@ class CodecTokenizer(AbsTokenizer):
 
         if self.codec_choice == "ESPnet":
             codes = codes.permute(2, 0, 1)
-            waveform = self.codec.decode(codes).squeeze(1)
+            waveform, quantized = self.codec.decode(codes)
+            quantized = quantized[0] # the two copy are the same
+            waveform = waveform.squeeze(1)
 
         elif self.codec_choice == "DAC":
             z = self.codec.quantizer.from_codes(codes.transpose(1, 2))[0]
@@ -304,39 +307,56 @@ if __name__ == "__main__":
         codec_fs=16000,
         device=device,
         dump_audio=True,
-        checkpoint_path="espnet_codec/16khz_soundstream/train.total_count.best.pth",
-        config_path="espnet_codec/16khz_soundstream/config.yaml",
+        hf_model_tag="ftshijt/espnet_codec_dac_large_v1.4_360epoch",
+        checkpoint_path="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/codec_test/360epoch.pth",
+        config_path="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/codec_test/config.yaml",
     )
 
     import soundfile as sf
+    audio_root = "/ocean/projects/cis210027p/yzhao16/speechlm_svscot/espnet/egs2/acesinger/speechlm1"
+    save_root = "/ocean/projects/cis210027p/yzhao16/speechlm_svscot/espnet/egs2/acesinger/speechlm1/codec_resyn"
+    audio_scp = "/ocean/projects/cis210027p/yzhao16/speechlm_svscot/espnet/egs2/acesinger/speechlm1/dump/audio_raw_cot_svs_acesinger/test_nolyrics/wav.scp"
+    
+    os.makedirs(save_root, exist_ok=True)
 
-    waveform, sr = sf.read("1272-128104-0004.wav")
-    waveform = (
-        torch.from_numpy(waveform).view(1, 1, -1).to(device).float()
-    )  # [B, C, n_sample]
-    waveform = waveform.repeat(2, 1, 1)
+    with open(audio_scp, 'r') as f1:
+        for line in f1:
+            key, audio_path = line.strip().split()
+            audio_file = os.path.join(audio_root, audio_path)
+            audio_file = "/ocean/projects/cis210027p/yzhao16/speechlm_svscot/espnet/egs2/acesinger/speechlm1/nl_wav_dump/acesinger_1#2044001628.wav"
 
-    with torch.no_grad():
-        # discrete
-        codes = codec.encode(waveform)
-        print(f"cdoes: ", codes.size())
-        resyn_audio = codec.decode(codes)
-        print(f"audio1", resyn_audio.size())
-        resyn_audio = resyn_audio[0].cpu().numpy()
-        sf.write("resyn1.wav", resyn_audio, sr)
+            waveform, sr = sf.read(audio_file)
+            waveform = (
+                torch.from_numpy(waveform).view(1, 1, -1).to(device).float()
+            )  # [B, C, n_sample]
+            waveform = waveform.repeat(2, 1, 1)
 
-        # continuous
-        z = codec.encode_continuous(waveform)
-        print(f"z: ", z.size())
-        resyn_audio2 = codec.decode_continuous(z)
-        print(f"audio2", resyn_audio2.size())
-        resyn_audio2 = resyn_audio2[0].cpu().numpy()
-        sf.write("resyn2.wav", resyn_audio2, sr)
+            with torch.no_grad():
+                # discrete
+                codes = codec.encode(waveform)
+                print(f"codes: ", codes)
+                resyn_audio = codec.decode(codes)
+                print(f"audio1", resyn_audio.size())
+                resyn_audio = resyn_audio[0].cpu().numpy()
 
-        # high level API for speechlm
-        flatten_codes, _ = codec(waveform)
-        print(f"flatten_codes", flatten_codes.size())
-        resyn_audio3 = codec.detokenize(flatten_codes)
-        print("resyn", resyn_audio3.size())
-        resyn_audio3 = resyn_audio3[0].cpu().numpy()
-        sf.write("resyn3.wav", resyn_audio3, sr)
+                save_file = os.path.join(save_root, f"{key}.wav")
+
+                sf.write(save_file, resyn_audio, sr)
+
+            break
+            # # continuous
+            # z = codec.encode_continuous(waveform)
+            # print(f"z: ", z.size())
+            # resyn_audio2 = codec.decode_continuous(z)
+            # print(f"audio2", resyn_audio2.size())
+            # resyn_audio2 = resyn_audio2[0].cpu().numpy()
+            # sf.write("resyn2.wav", resyn_audio2, sr)
+
+            # # high level API for speechlm
+            # flatten_codes, _ = codec(waveform)
+            # print(f"flatten_codes", flatten_codes.size())
+
+            # resyn_audio3 = codec.detokenize(flatten_codes)
+            # print("resyn", resyn_audio3.size())
+            # resyn_audio3 = resyn_audio3[0].cpu().numpy()
+            # sf.write("resyn3.wav", resyn_audio3, sr)

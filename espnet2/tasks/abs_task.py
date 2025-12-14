@@ -365,7 +365,7 @@ class AbsTask(ABC):
         group.add_argument(
             "--num_att_plot",
             type=int,
-            default=3,
+            default=0,
             help="The number images to plot the outputs from attention. "
             "This option makes sense only when attention-based model. "
             "We can also disable the attention plot by setting it 0",
@@ -478,6 +478,15 @@ class AbsTask(ABC):
             type=str2bool,
             help="Synchronize stats in each minibatch",
         )
+        group.add_argument(
+            "--torch_reseved_memory_gb",
+            default=-1,
+            type=float,
+            help="Memory specifically reserved for pytorch "
+                 "and will not be used by other libraries like deepspeed and NCCL. "
+                 "Only effective when using deepspeed trainer",
+        )
+
 
         group = parser.add_argument_group("cudnn mode related")
         group.add_argument(
@@ -802,6 +811,14 @@ class AbsTask(ABC):
             type=int_or_none,
             default=None,
             help="If not given, the value of --batch_bins is used",
+        )
+        group.add_argument(
+            "--sampler_allow_duplication",
+            type=str2bool,
+            default=False,
+            help="If true, allow duplication in sampler shape files. "
+                 "This is usually for data re-weighting "
+                 "Currently only for numel sampler"
         )
 
         group.add_argument("--train_shape_file", type=str, action="append", default=[])
@@ -1855,6 +1872,7 @@ class AbsTask(ABC):
             drop_last=args.drop_last_iter,
             min_batch_size=min_batch_size,
             utt2category_file=utt2category_file,
+            allow_duplication=args.sampler_allow_duplication,
         )
 
         batches = list(batch_sampler)
@@ -2250,6 +2268,7 @@ class AbsTask(ABC):
             device: Device type, "cpu", "cuda", or "cuda:N".
 
         """
+
         if config_file is None:
             assert model_file is not None, (
                 "The argument 'model_file' must be provided "
@@ -2268,7 +2287,6 @@ class AbsTask(ABC):
             raise RuntimeError(
                 f"model must inherit {AbsESPnetModel.__name__}, but got {type(model)}"
             )
-        model.to(device)
 
         # For finetuned model, create adapter
         use_adapter = getattr(args, "use_adapter", False)
@@ -2281,14 +2299,17 @@ class AbsTask(ABC):
                 #   in PyTorch<=1.4
                 device = f"cuda:{torch.cuda.current_device()}"
             try:
+                state_dict = torch.load(model_file, map_location='cpu')
+                if 'model' in state_dict:
+                    state_dict = state_dict['model']
                 model.load_state_dict(
-                    torch.load(model_file, map_location=device),
+                    state_dict,
                     strict=False,
                 )
             except RuntimeError:
                 # Note(simpleoier): the following part is to be compatible with
                 #   pretrained model using earlier versions before `0a625088`
-                state_dict = torch.load(model_file, map_location=device)
+                state_dict = torch.load(model_file, map_location='cpu')
                 if any(["frontend.upstream.model" in k for k in state_dict.keys()]):
                     if any(
                         [
@@ -2321,4 +2342,5 @@ class AbsTask(ABC):
                     else:
                         raise
 
+        model = model.to(device)
         return model, args
