@@ -3,6 +3,9 @@
 # Copyright 2024 Jinchuan Tian
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
+# Modification 2025 Yiwen Zhao
+# add svs task support
+
 # Set bash to 'debug' mode, it will exit on :
 # -e 'error', -u 'undefined variable', -o ... 'error in pipeline', -x 'print commands',
 set -e
@@ -105,6 +108,7 @@ codec_batch_size=3
 
 # (2) ssl
 ssl_choice="espnet_hubert" # currently only espnet_hubert
+ssl_feature_type="wavlm_large" # the model name, when using s3prl
 ssl_checkpoint_path=null
 ssl_kmeans_path=null
 ssl_nlayer=16
@@ -138,6 +142,10 @@ hf_repo=
 
 help_message=""
 
+# svs helpers
+svs_score_triplets="score.scp,svs_lb,text" 
+svs_text_triplets="text,svs_lb,text"
+
 log "$0 $*"
 # Save command line args for logging (they will be lost after utils/parse_options.sh)
 run_args=$(scripts/utils/print_args.sh $0 "$@")
@@ -149,7 +157,7 @@ if [ $# -ne 0 ]; then
     exit 2
 fi
 
-. ./path.sh
+# . ./path.sh
 . ./cmd.sh
 
 # Check for stage 1-5: data prep
@@ -196,10 +204,9 @@ if [ -z "${speechlm_stats_dir}" ]; then
 fi
 
 if [ "${subword_choice}" == "sentencepiece" ]; then
-    if  [ ! -z "${subword_model}" ]; then
-        if [ ! -f "${subword_model}".model ]; then
-            log "subword_model is specified but not exist ... " && exit 1;
-        fi
+    if [ ! -z ${token_list_dir} ] && [ -f "${token_list_dir}/text_bpe.model" ]; then
+        subword_model="${token_list_dir}/text_bpe"
+
     else
         if ! "${skip_data_prep}"; then
             subword_model=${data_feats}/${train_set}/token_lists/text_bpe
@@ -266,6 +273,10 @@ if ! "${skip_data_prep}"; then
         _min_length=$(python3 -c "print(int(${min_wav_duration} * ${_fs}))")
         _max_length=$(python3 -c "print(int(${max_wav_duration} * ${_fs}))")
 
+        if [ ${task}=="svs" ]; then
+            all_triplets="$all_triplets $svs_score_triplets $svs_text_triplets" #process assistant modalities
+        fi
+
         if ${skip_train}; then
             _dsets=${test_sets}
         else
@@ -306,6 +317,34 @@ if ! "${skip_data_prep}"; then
                     awk ' { if( NF != 1 ) print $0; } ' >"${data_audio}/${dset}/${_name}"
                 fi
             done
+
+            if [ ${task} == "svs" ]; then
+                # convert the separate score json files to an uniform text file
+                python utils/data/internal/convert_score.py --data_folder ${data_audio}/${dset}
+                echo "start to combine 3 input modalities"
+                
+                ## tokenize continuous duration to integer
+                # back up original label (st, ed, phn) --> new label (duration, phn)
+                ${python} utils/data/internal/tokenize_duration.py \
+                    --data_folder ${data_audio}/${dset} \
+                    --file_type "label"
+                
+                # back up original score (st, ed, sylb, midi, word) --> new score (duration, midi, word)
+                ${python} utils/data/internal/tokenize_duration.py \
+                    --data_folder ${data_audio}/${dset} \
+                    --file_type "score"
+                
+                ## preprocess svs data info to phn level triplets
+                ## find midi from score file, add to the label file and save as a new score file
+                ${python} utils/data/internal/make_svs_score_triplets.py \
+                    --data_folder ${data_audio}/${dset}
+
+                ## data format1 --> data format2
+                ${python} utils/data/internal/tokenize_duration.py \
+                    --data_folder ${data_audio}/${dset} \
+                    --file_type "duration"
+                rm ${data_audio}/${dset}/label2
+            fi
         done
     fi
 
@@ -365,6 +404,7 @@ if ! "${skip_data_prep}"; then
                         --codec_batch_size ${codec_batch_size} \
                         --codec_dump_audio false \
                         --ssl_choice ${ssl_choice} \
+                        --ssl_feature_type ${ssl_feature_type} \
                         --ssl_checkpoint_path ${ssl_checkpoint_path} \
                         --ssl_kmeans_path ${ssl_kmeans_path} \
                         --ssl_nlayer ${ssl_nlayer} \
@@ -385,6 +425,7 @@ if ! "${skip_data_prep}"; then
                         --nj ${nj} \
                         --batch_bins ${ssl_batch_bins} \
                         --ssl_choice ${ssl_choice} \
+                        --ssl_feature_type ${ssl_feature_type} \
                         --checkpoint_path ${ssl_checkpoint_path} \
                         --kmeans_path ${ssl_kmeans_path} \
                         --nlayer ${ssl_nlayer} \
@@ -473,6 +514,10 @@ if ! "${skip_data_prep}"; then
                     echo "copy utt2spk file"
                     cp "${data_audio}/${dset}/${_name}" "${data_feats}/${dset}/${_name}"
 
+                elif [ ${_modality} == "svs_lb" ]; then
+                    echo "copy label file"
+                    cp "${data_audio}/${dset}/${_name}" "${data_feats}/${dset}/${_name}"
+
                 else
                     echo "Unsupported modality ${_modality}" && exit 1;
                 fi
@@ -482,6 +527,12 @@ if ! "${skip_data_prep}"; then
                     opts+="--token_list ${data_feats}/${dset}/token_lists/${_modality}_token_list "
                 fi
             done
+
+            if [ ${task} == "svs" ]; then
+                ${python} utils/data/internal/dump_svs_tokenls.py \
+                    --input "${data_feats}/${dset}/label" \
+                    --output "${data_feats}/${dset}/token_lists/svs_lb_token_list"
+            fi
 
             # The metadata for this dataset/task is saved in a json file
             ${python} pyscripts/utils/make_speechlm_json.py \
@@ -576,12 +627,29 @@ if ! ${skip_train}; then
         if [ -n "${train_config}" ]; then
             _opts+="--config ${train_config} "
         fi
+        _opts+="--sampler_allow_duplication true"
 
-        # (1) for each  split by ${global_ngpu} and assign statistics
+        # (1) handle the re-weighting factors of training data
+        declare -A reweight_factors
+        _train_jsons=
+        use_reweight=false
+        for data_json in ${train_jsons}; do
+            if [[ "$data_json" == *:* ]]; then
+                IFS=":" read -r data_json factor <<< "$data_json"
+                _train_jsons+="${data_json} "
+            else
+                factor=1.0
+                _train_jsons+="${data_json} "
+            fi
+            reweight_factors["${data_json}"]=${factor}
+        done
+        train_jsons=${_train_jsons}
+
+        # (2) for each  split by ${global_ngpu} and assign statistics
         for data_json in ${train_jsons} ${valid_jsons}; do
             stats_dir=$(dirname ${data_json})/stats
             if [ ! -f ${stats_dir}/dec_seq_shape ]; then
-                log "${data_json} doesn't have length statistics. Please rerun stage 7"
+                log "${data_json} doesn't have length statistics. Please rerun stage 7" || exit 1;
             fi
 
             if [ ! -f ${stats_dir}/split${global_ngpu}/1/dec_seq_shape ]; then
@@ -602,7 +670,7 @@ if ! ${skip_train}; then
             fi
         done
 
-        # (2) aggregate all statistics
+        # (3) aggregate all statistics
         _data_opts=
 
         for data_json in ${train_jsons}; do
@@ -618,8 +686,9 @@ if ! ${skip_train}; then
         mkdir -p ${speechlm_stats_dir}/train/split${global_ngpu}
         for n in `seq ${global_ngpu}`; do
             for data_json in ${train_jsons}; do
-                cat $(dirname ${data_json})/stats/split${global_ngpu}/${n}/dec_seq_shape
-            done > ${speechlm_stats_dir}/train/split${global_ngpu}/dec_seq_shape.${n}
+                repeat=${reweight_factors["${data_json}"]}
+                cat $(dirname ${data_json})/stats/split${global_ngpu}/${n}/dec_seq_shape | awk -v N=${repeat} '{for(i=0;i<N;i++) print}'
+            done | shuf > ${speechlm_stats_dir}/train/split${global_ngpu}/dec_seq_shape.${n}
         done
         _data_opts+="--train_shape_file ${speechlm_stats_dir}/train/split${global_ngpu}/dec_seq_shape.JOB "
 
@@ -672,14 +741,15 @@ if [ -n "${download_model}" ]; then
 fi
 
 if ! "${skip_eval}"; then
+
+    if ! ${skip_data_prep}; then
+        for test_set in ${test_sets}; do
+            test_jsons+="${data_feats}/${test_set}/data.json "
+        done
+    fi
+
     if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
         log "Stage 9: Inference: training_dir=${speechlm_exp}"
-
-        if ! ${skip_data_prep}; then
-            for test_set in ${test_sets}; do
-                test_jsons+="${data_feats}/${test_set}/data.json "
-            done
-        fi
 
         if ${gpu_inference}; then
             _cmd="${cuda_cmd}"
@@ -747,12 +817,6 @@ if ! "${skip_eval}"; then
             _ngpu=0
         fi
 
-        if ! ${skip_data_prep}; then
-            for test_set in ${test_sets}; do
-                test_jsons+="${data_feats}/${test_set}/data.json "
-            done
-        fi
-
         for test_json in ${test_jsons}; do
             # (1) Find task, dataset name and folder name
             task=$(grep -o '"task": *[^,}]*' ${test_json} | sed -e 's/"task": *//' -e 's/"//g')
@@ -801,7 +865,7 @@ if ! "${skip_eval}"; then
 
                 utils/filter_scp.pl ${_dir}/eval_cache/gen_list ${_dir}/eval_cache/${name} \
                     > ${_dir}/eval_cache/${name}.tmp
-                mv ${_dir}/eval_cache/${name}.tmp ${_dir}/eval_cache/${name}
+                sort ${_dir}/eval_cache/${name}.tmp > ${_dir}/eval_cache/${name}
             done
 
             # (2.3) generated valid keys
