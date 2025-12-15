@@ -15,11 +15,12 @@ from typeguard import typechecked
 from espnet2.gan_svs.abs_gan_svs import AbsGANSVS
 from espnet2.gan_svs.avocodo.avocodo import (
     SBD,
-    AvocodoDiscriminator,
+AvocodoDiscriminator,
     AvocodoDiscriminatorPlus,
     CoMBD,
 )
-from espnet2.gan_svs.visinger2.visinger2_vocoder import VISinger2Discriminator
+from espnet2.gan_svs.visinger2.visinger2_vocoder import VISinger2Discriminator # NOTE(yiwen) the discriminator class we use
+from espnet2.gan_svs.vits.uncertainty_predictor_featstosample import FeatstosamplePredictor
 from espnet2.gan_svs.vits.generator import VISingerGenerator
 from espnet2.gan_tts.hifigan import (
     HiFiGANMultiPeriodDiscriminator,
@@ -37,6 +38,8 @@ from espnet2.gan_tts.hifigan.loss import (
 from espnet2.gan_tts.utils import get_segments
 from espnet2.gan_tts.vits.loss import KLDivergenceLoss, KLDivergenceLossWithoutFlow
 from espnet2.torch_utils.device_funcs import force_gatherable
+
+import torch.nn as nn
 
 AVAILABLE_GENERATERS = {
     "visinger": VISingerGenerator,
@@ -318,6 +321,7 @@ class VITS(AbsGANSVS):
         """
         super().__init__()
 
+        self.use_uncertainty_predictor=True
         # define modules
         generator_class = AVAILABLE_GENERATERS[generator_type]
         if "visinger" in generator_type or "pisinger" in generator_type:
@@ -413,6 +417,18 @@ class VITS(AbsGANSVS):
         self.adaptive_pool = torch.nn.AdaptiveAvgPool1d(1)
         self.n_mels = mel_loss_params["n_mels"]
 
+        # NOTE(yiwen) add uncertainty predictor to discriminator
+        self.intervals = None
+        if self.use_uncertainty_predictor:
+            H = 192
+            T = 10240
+            self.uncertainty_predictor = FeatstosamplePredictor(H, H, T)
+            
+            self.uncertainty_loss_weight = 10.0
+            self.uncertainty_threshold = 0.035
+            self.uncertainty_ratio = 0.75 # >thres frame ratio in one T//10 window, but will not sample the whole continuous segment
+            
+
     @property
     def require_raw_singing(self):
         """Return whether or not singing is required."""
@@ -499,7 +515,7 @@ class VITS(AbsGANSVS):
         melody = melody["lab"]
 
         if forward_generator:
-            return self._forward_generator(
+            return self._forward_generator( # first generator, then discrimitor
                 text=text,
                 text_lengths=text_lengths,
                 feats=concatenated_feats,
@@ -675,6 +691,16 @@ class VITS(AbsGANSVS):
             segment_size=self.generator.segment_size * self.generator.upsample_factor,
         )
 
+        if self.use_uncertainty_predictor:
+            uncertainty_loss = 0
+            # NOTE(yiwen) predicted_uncertainty is in shape (B, T); update the predictor
+
+            target_uncertainty = torch.sqrt(torch.clamp((singing_.squeeze(1) - singing_hat_.squeeze(1)) ** 2, min=1e-8)) # predict L2
+            
+            predicted_uncertainty = self.uncertainty_predictor(m_q)
+            uncertainty_loss = nn.MSELoss()(predicted_uncertainty, target_uncertainty)
+            uncertainty_loss = uncertainty_loss * self.uncertainty_loss_weight 
+
         # calculate discriminator outputs
         if "avocodo" in self.discriminator_type:
             p, p_hat, fmaps_real, fmaps_fake = self.discriminator(
@@ -718,7 +744,7 @@ class VITS(AbsGANSVS):
                 adv_loss = self.generator_adv_loss(p_hat)
                 feat_match_loss = self.feat_match_loss(fmaps_fake, fmaps_real)
             else:
-                adv_loss = self.generator_adv_loss(p_hat)
+                adv_loss = self.generator_adv_loss(p_hat, self.intervals)
                 feat_match_loss = self.feat_match_loss(p_hat, p)
 
             pitch_loss = self.mse_loss(pred_pitch, gt_pitch)
@@ -755,6 +781,9 @@ class VITS(AbsGANSVS):
             loss = loss + pitch_loss
             loss = loss + phoneme_dur_loss
             loss = loss + score_dur_loss
+            
+            if self.use_uncertainty_predictor:
+                loss = loss + uncertainty_loss # NOTE(yiwen) 
             if self.use_phoneme_predictor:
                 loss = loss + ctc_loss
             if "pisinger" in self.generator_type:
@@ -794,6 +823,13 @@ class VITS(AbsGANSVS):
             stats.update(
                 dict(
                     generator_yin_dec_loss=yin_dec_loss.item(),
+                )
+            )
+        if self.use_uncertainty_predictor:
+            stats.update(
+                dict(
+                    generator_uncertainty_loss=uncertainty_loss.item(),
+                    # generator_uncertainty_loss=uncertainty_loss
                 )
             )
 
@@ -909,11 +945,11 @@ class VITS(AbsGANSVS):
             )
         else:
             p_hat = self.discriminator(singing_hat_.detach())
-            p = self.discriminator(singing_)
+            p = self.discriminator(singing_) # discriminator提取出来的在temporal做了下采样的特征
 
         # calculate losses
-        with autocast(enabled=False):
-            real_loss, fake_loss = self.discriminator_adv_loss(p_hat, p)
+        with autocast(enabled=False): # batch_intervals 
+            real_loss, fake_loss = self.discriminator_adv_loss(p_hat, p, self.intervals) #TODO(yiwen) also pass the intervals here
             loss = real_loss + fake_loss
 
         stats = dict(
@@ -985,7 +1021,8 @@ class VITS(AbsGANSVS):
         label = label["lab"]
         melody = melody["lab"]
         score_dur = duration["score_syb"]
-        gt_dur = duration["lab"]
+        if "lab" in duration:
+            gt_dur = duration["lab"]
         text = text[None]
         text_lengths = torch.tensor(
             [text.size(1)],

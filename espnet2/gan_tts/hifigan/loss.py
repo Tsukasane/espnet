@@ -42,6 +42,7 @@ class GeneratorAdversarialLoss(torch.nn.Module):
     def forward(
         self,
         outputs: Union[List[List[torch.Tensor]], List[torch.Tensor], torch.Tensor],
+        uncertainty_intervals: List,
     ) -> torch.Tensor:
         """Calcualate generator adversarial loss.
 
@@ -49,6 +50,7 @@ class GeneratorAdversarialLoss(torch.nn.Module):
             outputs (Union[List[List[Tensor]], List[Tensor], Tensor]): Discriminator
                 outputs, list of discriminator outputs, or list of list of discriminator
                 outputs..
+            uncertainty_intervals (B, 2)
 
         Returns:
             Tensor: Generator adversarial loss value.
@@ -56,10 +58,19 @@ class GeneratorAdversarialLoss(torch.nn.Module):
         """
         if isinstance(outputs, (tuple, list)):
             adv_loss = 0.0
+            use_diffaug_random = False
+            use_diffaug = False #NOTE(yiwen)
             for i, outputs_ in enumerate(outputs):
                 if isinstance(outputs_, (tuple, list)):
                     # NOTE(kan-bayashi): case including feature maps
                     outputs_ = outputs_[-1]
+                    if use_diffaug:
+                        from espnet2.gan_tts.hifigan.diff_aug import DiffAugment
+                        outputs_ = DiffAugment(outputs_, 'mixup', uncertainty_intervals)
+                        # print(f'debug8 -- outputs_.shape {outputs_.shape}')
+                    if use_diffaug_random:
+                        from espnet2.gan_tts.hifigan.diff_aug_random import DiffAugment
+                        outputs_ = DiffAugment(outputs_, 'mixup')
                 adv_loss += self.criterion(outputs_)
             if self.average_by_discriminators:
                 adv_loss /= i + 1
@@ -105,6 +116,7 @@ class DiscriminatorAdversarialLoss(torch.nn.Module):
         self,
         outputs_hat: Union[List[List[torch.Tensor]], List[torch.Tensor], torch.Tensor],
         outputs: Union[List[List[torch.Tensor]], List[torch.Tensor], torch.Tensor],
+        uncertainty_intervals: List,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Calcualate discriminator adversarial loss.
 
@@ -124,11 +136,22 @@ class DiscriminatorAdversarialLoss(torch.nn.Module):
         if isinstance(outputs, (tuple, list)):
             real_loss = 0.0
             fake_loss = 0.0
+            use_diffaug_random = False
+            use_diffaug = False 
             for i, (outputs_hat_, outputs_) in enumerate(zip(outputs_hat, outputs)):
                 if isinstance(outputs_hat_, (tuple, list)):
+                    # print(f'debug2 -- len(outputs_hat_) {len(outputs_hat_)}') # the concated list of the outputs from three discriminators
                     # NOTE(kan-bayashi): case including feature maps
-                    outputs_hat_ = outputs_hat_[-1]
-                    outputs_ = outputs_[-1]
+                    outputs_hat_ = outputs_hat_[-1] 
+                    outputs_ = outputs_[-1] 
+                    if use_diffaug:
+                        from espnet2.gan_tts.hifigan.diff_aug import DiffAugment
+                        outputs_hat_ = DiffAugment(outputs_hat_, 'mixup', uncertainty_intervals) # NOTE(yiwen) before adding uncertainty_intervals, not the same random augmented segments
+                        outputs_ = DiffAugment(outputs_, 'mixup', uncertainty_intervals)
+                    if use_diffaug_random:
+                        from espnet2.gan_tts.hifigan.diff_aug_random import DiffAugment
+                        outputs_hat_ = DiffAugment(outputs_hat_, 'mixup') # NOTE(yiwen) before adding uncertainty_intervals, not the same random augmented segments
+                        outputs_ = DiffAugment(outputs_, 'mixup')
                 real_loss += self.real_criterion(outputs_)
                 fake_loss += self.fake_criterion(outputs_hat_)
             if self.average_by_discriminators:
@@ -270,7 +293,6 @@ class MelSpectrogramLoss(torch.nn.Module):
         y_hat: torch.Tensor,
         y: torch.Tensor,
         spec: Optional[torch.Tensor] = None,
-        use_mse: bool = False,
     ) -> torch.Tensor:
         """Calculate Mel-spectrogram loss.
 
@@ -280,7 +302,6 @@ class MelSpectrogramLoss(torch.nn.Module):
             spec (Optional[Tensor]): Groundtruth linear amplitude spectrum tensor
                 (B, T, n_fft // 2 + 1).  if provided, use it instead of groundtruth
                 waveform.
-            use_l2 (bool): Whether to use mse_loss instead of l1
 
         Returns:
             Tensor: Mel-spectrogram loss value.
@@ -291,9 +312,6 @@ class MelSpectrogramLoss(torch.nn.Module):
             mel, _ = self.wav_to_mel(y.squeeze(1))
         else:
             mel, _ = self.wav_to_mel.logmel(spec)
-        if use_mse:
-            mel_loss = F.mse_loss(mel_hat, mel)
-        else:
-            mel_loss = F.l1_loss(mel_hat, mel)
+        mel_loss = F.l1_loss(mel_hat, mel)
 
         return mel_loss

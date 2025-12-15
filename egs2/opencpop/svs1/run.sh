@@ -6,21 +6,15 @@ set -u
 set -o pipefail
 
 # spectrogram-related arguments
-fs=24000 # 24000 or 441000
-fmin=
-fmax=
-n_fft=
-n_shift=
-win_length=
-
-if [ $fs -eq 24000 ]; then
+fs=44100
+if [ ${fs} -eq 24000 ];then
     fmin=0
-    fmax=22050
+    fmax=12000
     n_fft=2048
-    n_shift=300
-    win_length=1200
-elif [ $fs -eq 44100 ]; then
-    fmin=0
+    n_shift=256
+    win_length=2048
+elif [ ${fs} -eq 44100 ]; then
+    fmin=80
     fmax=22050
     n_fft=2048
     n_shift=512
@@ -33,11 +27,11 @@ opts="--audio_format wav "
 
 train_set=tr_no_dev
 valid_set=dev
-test_sets="dev test"
+test_sets="dev eval"
 
 # training and inference configuration
-train_config=conf/train.yaml
-inference_config=conf/decode.yaml
+train_config=conf/tuning/train_visinger2.yaml
+inference_config=conf/tuning/decode_vits.yaml
 
 # text related processing arguments
 g2p=None
@@ -48,10 +42,17 @@ ying_extract=None
 
 ./svs.sh \
     --lang zh \
+    --stage 6 \
+    --stop_stage 6 \
+    --inference_model 300epoch_save.pth \
+    --tag diffaug_and_uc_from200 \
+    --svs_task gan_svs \
     --local_data_opts "--stage 0" \
     --feats_type raw \
     --pitch_extract "${pitch_extract}" \
     --ying_extract "${ying_extract}" \
+    --feats_extract fbank \
+    --feats_normalize none \
     --fs "${fs}" \
     --fmax "${fmax}" \
     --fmin "${fmin}" \
@@ -68,4 +69,5 @@ ying_extract=None
     --test_sets "${test_sets}" \
     --score_feats_extract "${score_feats_extract}" \
     --srctexts "data/${train_set}/text" \
+    --write_collected_feats true \
     ${opts} "$@"
